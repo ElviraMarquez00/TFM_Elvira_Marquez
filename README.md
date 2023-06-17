@@ -15,4 +15,4 @@ This script aims to apply a supervised learning technique to develop a predictiv
 
 ## Data
 Due to the ethical and legal issues supporting this research, and in order to ensure the privacy and confidentiality of the subjects of this study, the data for the execution of these scripts are not publicly available for viewing or downloading. Proteomics data (not clinical data) will be made available upon request to the author.
-In the main directory you can find the scripts used for the analysis, in .Rmd format and in HTML format, as well as some files from their execution (REVIGO treemaps, tsv files with enriched GO terms, etc). 
+In the main directory you can find the scripts used for the analysis, in .Rmd format and in PDF format, as well as some files from their execution (REVIGO treemaps, tsv files with enriched GO terms, etc). 
