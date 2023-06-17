@@ -1,0 +1,221 @@
+---
+title: "Mapping the HDL proteome in Metabolic Syndrome through label-free quantification."
+author: Elvira Márquez Paradas
+output: html_document
+date: "2023-06-05"
+Summaryze:  This script aims to apply a supervised learning technique to develop a predictive model from healthy and Metabolic Syndrome (MetS) patients proteomics data. The objective will be to create a sPLS-DA with the highest possible accuracy, identifying also the proteins or genes most involved in the separation of groups.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We will generate a sample classification model using the sPLS-DA (sparse partial least squares discriminant analysis) method, which finds discriminant relationships between groups in the multivariate data set, also employing a feature selection approach to identify the most relevant subset of proteins in group differentiation.
+
+```{r}
+library(mixOmics) 
+set.seed(5249)
+
+# Creation of the Y variable containing the patient groups.
+Y=as.factor(c(rep("H", 17), rep("MetS", 19)))
+
+# Creation of the X variable, contaning the genes with their expression values
+genes=read.table("./data/preprocessed_data_cero_imputed.txt", header = T, sep = "\t", na.strings = "NaN")
+genes=t(genes)
+gene_names=genes[1,]
+gene_names <- gsub(";.*|_.*", "", gene_names)    # Shorten gene names to improve graphics
+gene_names[62]= "IGKV3D-20"   # Modify to avoid having repeated gene names
+gene_names[43]= "APOM_APOM"
+X=genes[-1,]
+colnames(X)=gene_names
+X <- apply(X, c(1, 2), as.numeric) #Convert matrix values to numerical values
+
+```
+
+## PRINCIPAL COMPONENT ANALYSIS (PCA)
+We visualise the behaviour of the samples by dimensionality reduction analysis
+
+```{r}
+pca = pca(X, ncomp = 10, center = F, scale = F) 
+
+# Number of components
+######
+plot(pca)
+
+# Component 1-2
+#####
+plotIndiv(pca, comp=c(1,2), group = Y, ind.names = FALSE, 
+          legend = TRUE, title = 'PCA, comp 1 - 2',col.per.group = c("firebrick","steelblue"))
+
+# Component 2-3
+#####
+plotIndiv(pca, comp=c(2,3), group = Y, ind.names = FALSE, 
+          legend = TRUE, title = 'PCA, comp 2 - 3',col.per.group = c("firebrick","steelblue"),) 
+
+
+```
+
+The first 3 components explain 39% of the variance. The main component responsible for explaining the difference between groups is component 2.
+
+## INITIAL PLS-DA MODEL
+In PLS-DA, we seek to find a linear combination of predictor variables (X) that is highly correlated with the class variables (Y), thus maximizing the separation between classes.
+First of all, we will generate a initial PLS-DA.
+
+```{r}
+splsda <- splsda(X, Y, ncomp = 10)  
+
+plotIndiv(splsda , comp = 1:2, 
+          group = Y, ind.names = FALSE,
+          col.per.group = c("firebrick","steelblue"),
+          ellipse = TRUE, 
+          legend = TRUE, title = 'PLSDA, comp 1-2',
+          legend.labels = legend_labels)
+
+plotIndiv(splsda , comp = 2:3, 
+          group = Y, ind.names = FALSE,  
+          ellipse = TRUE, 
+          col.per.group = c("firebrick","steelblue"),
+          legend = TRUE, title = 'PLSDA,comp 2-3',
+          legend.labels = legend_labels,
+          cex.main=0.8)
+
+```
+
+The first 3 components explain 24% of the variance of the data. Component 1 is responsible for group separation.
+
+## TUNING sPLS-DA   
+Next, we will validate the performance of the previously created model using the M-Fold cross-validation method and select the optimal number of components and variables.
+
+```{r}
+# Evaluation of the performance of the model created 
+#####
+perf.splsda <- perf(splsda, validation = "Mfold", 
+                          folds = 5, nrepeat = 20, 
+                          progressBar = FALSE, auc = TRUE)
+
+plot(perf.splsda, col = color.mixo(5:7), sd = TRUE,
+     legend.position = "horizontal")
+
+# From this, it seems 7 components are the optimal.
+#####
+perf.splsda$choice.ncomp
+
+# Selecting the number of variables
+#####
+list.keepX <- c(1:10,  seq(20, 100, 10))
+list.keepX
+
+# Undergo the tuning process to determine the optimal number of variables
+#####
+tune.splsda <- tune.splsda(X, Y, ncomp = 7, 
+                                 validation = 'Mfold',
+                                 folds = 5, nrepeat = 20, 
+                                 dist = "max.dist", 
+                                 measure = "BER", 
+                                 test.keepX = list.keepX,
+                                 cpus = 2) 
+
+plot(tune.splsda, col = color.jet(7)) # Plot output of variable number tuning
+tune.splsda$choice.ncomp$ncomp # First 2 components selected
+
+# In summary: 
+#####
+optimal.ncomp <- tune.splsda$choice.ncomp$ncomp
+optimal.ncomp # First 2 components selected
+optimal.keepX <- tune.splsda$choice.keepX[1:optimal.ncomp]
+optimal.keepX # First component with 80 proteins and second one with 50 proteins
+
+```
+The optimal model will have two components with 80 and 50 variables, respectively.
+
+
+## FINAL sPLS-DA 
+Finally, we will create the final model with the optimal number of components and variables
+variables selected in the training and validation process.
+
+```{r}
+# Model generation
+#####
+final.splsda <- splsda(X, Y, 
+                       ncomp = optimal.ncomp, 
+                       keepX = optimal.keepX)
+
+# Visualization of the proteins most involved in group separation
+#####
+plotLoadings(final.splsda, comp = 1, method = 'mean', contrib = 'max',
+             legend.color = c("firebrick","steelblue"),title="Contribution on component 1",
+             size.legend=0.8, size.title=1,size.name = 0.5)
+
+
+plotIndiv(final.splsda, comp = c(1,2), 
+          group = Y, ind.names = FALSE, 
+          ellipse = TRUE, legend = TRUE,
+          col.per.group = c("firebrick","steelblue"),
+          title = 'sPLS-DA, comp 1 - 2',size.title = 14)
+
+```
+
+Next, we extract the variables or proteins selected for each component:
+```{r}
+comp = 1
+comp1= which(final.splsda$loadings$X[, comp] != 0)
+comp1=as.data.frame(comp1)
+comp1=rownames(comp1)
+comp1
+comp = 2 
+comp2=which(final.splsda$loadings$X[, comp] != 0)
+comp2=as.data.frame(comp2)
+comp2=rownames(comp2)
+comp2
+```
+
+### PREDICTION     
+Before evaluating the predictive capability of the model, we will segment the PLS-DA(s)data into training and test data sets. First, we will train the model with the training dataset, and then evaluate its predictive capability with the test dataset.
+
+```{r}
+train <- sample(1:nrow(X), 30) # randomly select 30 samples in training
+test <- setdiff(1:nrow(X), train)
+
+# Store matrices into training and test set
+#####
+X.train <- X[train, ] 
+X.test <- X[test,] 
+Y.train <- Y[train] 
+Y.test <- Y[test] 
+
+# Train the model on the training data
+#####
+train.splsda.srbct <- splsda(X.train, Y.train, ncomp = optimal.ncomp, keepX = optimal.keepX)
+
+# The model is then applied on the test set
+#####
+predict.splsda.srbct <- predict(train.splsda.srbct, X.test, 
+                                dist = "max.dist")
+
+# Evaluate the prediction accuracy for the first two components
+#####
+predict.comp2 <- predict.splsda.srbct$class$max.dist[,2]
+table(factor(predict.comp2, levels = levels(Y)), Y.test)
+
+``` 
+
+
+### MODEL EVALUATION
+We will use the calculation of the area under the curve to evaluate the accuracy of the model.
+
+```{r}
+pdf("AUC.pdf")
+auc.splsda = auroc(final.splsda, roc.comp = 1, print = TRUE)
+auc.splsda = auroc(final.splsda, roc.comp = 2, print = TRUE) 
+dev.off()
+```
+
+The area under the cyrva obtained for both components is 1, which indicates the presence of overfitting. This implies that the model generated is only valid for the data with which we have created it, and that it will not be able to generalize to other data sets.
+A larger number of samples will probably be needed to improve the accuracy and quality of the model.
+
+
+
+
+
+
+

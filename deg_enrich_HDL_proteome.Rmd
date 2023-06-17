@@ -1,0 +1,584 @@
+---
+title: "Mapping the HDL proteome in Metabolic Syndrome through label-free quantification."
+author: Elvira Márquez Paradas
+output: html_document
+date: "2023-06-05"
+Summaryze:  The aim of this script is to analyse the HDL proteome of patients with metabolic syndrome (MetS) and healthy (H) patients to determine the proteins associated with this clinical condition. To this end, an exploratory analysis was first performed, before and after pre-processing the dataset. Next, a differential expression analysis was performed, and finally, a functional enrichment analysis of the differentially expressed proteins, with the aim of determining the Biological Processes that are altered by the pathology.
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+The packages required for the execution of this script can be loaded below:
+
+```{r}
+# List of packages to be used
+packages_cran <- c("tidyverse", "ggplot2", "tidyr", "stats", "factoextra","FactoMineR")
+packages_bioconductor <- c("limma", "clusterProfiler", "org.Hs.eg.db", "treemap")
+
+# Check if CRAN packages are installed and, if not, install them.
+for (package in packages_cran) {
+  if (!requireNamespace(package, quietly = TRUE)) {
+    install.packages(package)
+  }
+}
+
+# Check if the Bioconductor packages are installed and, if not, install them.
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+BiocManager::install(packages_bioconductor)
+
+# Load packages
+library(tidyverse)
+library(ggplot2)
+library(tidyr)
+library(stats)
+library(factoextra)
+library(limma)
+library(FactoMineR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(treemap)
+
+```
+
+## DATA PREPROCESSING
+First, we load the data, select the columns of interest and rename them to facilitate the analysis. We have proteomics data from 17 healthy patients and 20 patients with Metabolic Syndrome. For the analysis, we will use the **LFQ intensity**, which will allow the comparison of the relative abundance of proteins between different samples.
+
+```{r}
+
+patients <- read.table("./data/proteinGroups.txt", header = T, sep = "\t", na.strings = "NaN")
+dim(patients) 
+
+patients <- dplyr::select(patients, select = c("Protein.IDs", "Protein.names", "Gene.names", 
+                                        matches("^LFQ.intensity."), "Only.identified.by.site", "Reverse", "Potential.contaminant"))
+
+names <- read.table("./data/names.txt", sep = "\n")[,1] 
+colnames(patients)=names
+
+```
+The number of proteins before data pre-processing is 580. 
+Let's check the behavior of the samples before data pre-processing 
+
+```{r}
+# Reorganization of data
+#####
+patients.pca= patients[,-c(1:3,41:43)]
+pca.data<- data.frame(colnames(patients.pca),t(patients.pca))
+colnames(pca.data)[1] <- "Sample"
+pca.data[, -1] <- scale(pca.data[, -1], center = T, scale = F)
+
+# Principal Component Analysis
+#####
+res.pca <- PCA(pca.data[,-1], graph = F,scale.unit = F, ncp = 10 )
+res.pca$eig
+
+# Individual plot
+#####
+H <- rep("Healthy (H)", 17)
+MS <- rep("Metabolic Syndrome (MetS)", 20)
+fviz_pca_ind(res.pca, col.ind = c(H,MS),
+             pointsize=2, pointshape=21, fill="white",
+             repel = TRUE, 
+             addEllipses = TRUE,ellipse.type = "confidence",
+             ellipse.level= 0.95,
+             legend.title="Conditions",
+             title="Principal Component Analysis (Raw data)", 
+             show_legend=TRUE,show_guide=TRUE)
+
+```
+
+We replace the 0's by missing values (NA) and transforme the data to logarithmic scale to decrease the variance and homogenize the data.
+
+```{r}
+# 0's deletion 
+#####
+patients[patients == 0] <- NA
+
+# Log2 transformation
+#####
+cols <- names(patients)[grepl("^H|^MS", names(patients))]
+patients[cols] <- lapply(patients[cols], log2)
+
+```
+
+We filter the proteins, eliminating reversed proteins, dentified only by site, and potential contaminants. Finally, we remove from the dataset those columns that will not be used again.
+
+```{r}
+patients <- patients %>% filter(Potential.contaminant != "+" & Only.identified.by.site != "+" & Reverse != "+")
+dim(patients)
+
+patients <- patients %>% dplyr::select(-any_of(c("Potential.contaminant","Only.identified.by.site", "Reverse")))
+data <- patients
+```
+
+After the tidying up the data, the missing values have to be dealt with. Only proteins that have been detected in at least 70% of the samples will be taken into account.
+
+```{r}
+temp <- data.frame(Samples=colnames(data), NA_number=colSums(is.na(data))/nrow(data)) 
+temp=temp[-c(1:3),]
+ggplot(temp, aes(x=NA_number, y= Samples)) + 
+  geom_bar(stat = "identity", fill = ifelse (temp$NA_number >= 0.7 ,
+                                             "firebrick","steelblue")) +
+  theme_minimal() 
+
+# In red, all the samples with more than 30% of missing values. Compare it afterwards
+# the removal of those noisy proteins:
+
+data <- data[which(rowMeans(!is.na(data))> 0.7),]
+temp <- data.frame(Samples = colnames(data), NA_number = colSums(is.na(data)) / nrow(data) * 100)
+temp=temp[-c(1:3),]
+ggplot(temp, aes(x=NA_number, y= Samples)) + 
+  geom_bar(stat = "identity", fill = ifelse (temp$NA_number >= 70 ,
+                                             "firebrick","steelblue")) +
+  theme_minimal() 
+dim(data)
+write.table(temp, file = "./data/data_preproccessed.txt", sep = "\t", quote = F, row.names = F)
+```
+
+In general, there are not too many missing values after preprocessing,, but 1 sample stands out with a notably higher number than the rest. The MS20 patient has more than 80% of missing values, probably due to experimental errors in the sample. This sample is eliminated for further analysis. After preprocessing, the total number of proteins is 174. 
+Finally, we will reorganize the data in a matrix for the following steps.
+
+```{r}
+# Removal of patient MS20
+#####
+data <- subset(data, select = -MS20B)
+
+# Reorganization of data into a matrix table for next steps
+#####
+protein.id <- data$Protein.IDs
+Gene.names=data$Gene.names
+data=data[,-c(1:3)] 
+protein.id <- gsub(";.+", "",protein.id)  #Keep only the first accession number
+rownames(data)=protein.id
+data=data.matrix(data)
+dim(data)
+```
+
+*Normalization of the dataset:*
+the distribution of the data should be checked, before and after the normalization.
+A multiple Shapiro Wilkinson test will be performed to each protein intensity in order to check the normality. The p values obtained will be adjusted by an 
+stringent method (Holm method 1979).
+
+```{r}
+counts <- 2^data
+p_values <- data.frame(protein.id=rownames(counts), 
+                       p.value=apply( counts,1, function(x) shapiro.test(x)$p.value))
+p_values$adj.p.val <- p.adjust(p_values$p.value, method = "holm")
+table(p_values$adj.p.val>0.05)
+
+```
+
+We observe that 118 of the 174 proteins conforme to a normal distribution. 
+We visualise the distribution of intensities in each sample before normalisation.
+
+```{r}
+y_axis_title = "Log2(LFQ_intensity)"
+x_axis_title = "Samples"
+main_title = "Boxplot Preprocessed Data"
+colors <- c(rep("firebrick", 17), rep("steelblue", 19))
+boxplot(data, outline = FALSE, col = colors, cex.lab = 1.5, xaxt = "n")
+title(ylab = y_axis_title, xlab=x_axis_title)
+title(main = main_title, cex.main = 1.2)
+legend("topleft", legend = c("Healthy (H)", "Metabolic Syndrome (MS)"), fill = c("firebrick", "steelblue"), cex = 0.5)
+
+```
+
+Since a large number of proteins fit a normal distribution, and the behavior of the samples is quite homogeneous, we decided not to apply any normalization method. We will work with the data transformed to logarithmic scale. 
+
+*Principal Component Analysis (PCA):*
+Next, in order to identify patterns of interest, detect possible outliers and visualize whether there are different proteomic profiles in both study groups, we performed dimensionality reduction using PCA. 
+
+```{r}
+# Reorganization of data
+#####
+pca.data<- data.frame(colnames(data),t(data))
+colnames(pca.data)[1] <- "Sample"
+pca.data[, -1] <- scale(pca.data[, -1], center = T, scale = F)
+
+pca.data[is.na(pca.data)] <- 0    #Imputation of NA values by zero
+table(is.na(pca.data))
+
+pca.data.mixomics=t(pca.data)
+data.omics=cbind(Gene.names,pca.data.mixomics[-1,])
+write.table(data.omics, file = "./data/preprocessed_data_cero_imputed.txt", sep = "\t", quote = F, row.names = F)
+
+# Principal Component Analysis
+#####
+res.pca <- PCA(pca.data[,-1], graph = F,scale.unit = F, ncp = 10 )
+res.pca$eig
+
+# Individual plot
+#####
+H <- rep("Healthy (H)", 17)
+MS <- rep("Metabolic Syndrome (MS)", 19)
+fviz_pca_ind(res.pca, col.ind = c(H,MS),
+             pointsize=2, pointshape=21, fill="white",
+             repel = TRUE, 
+             addEllipses = TRUE,ellipse.type = "confidence",
+             ellipse.level= 0.95,
+             legend.title="Conditions",
+             title="Principal Component Analysis (Preprocessed data)", 
+             show_legend=TRUE,show_guide=TRUE)
+
+```
+
+In order to maintain a conservative approach and avoid risky assumptions, missing values will be imputed by 0. This dataset will be used later for the differential expression analysis and the performance of the sPLS-DA.
+
+```{r}
+# Imputation of missing data values to 0
+####
+data.mean=data
+na_values = is.na(data)
+data[na_values]=0
+
+```
+
+On the other hand, in order to avoid possible biases in the analysis of linear correlations and logistic regression, we will create a dataset with the missing values imputed by the mean of each group.
+
+```{r}
+# Imputation of missing data values by mean
+####
+h= data.mean[, grepl("^H", colnames(data.mean))]
+ms= data.mean[, grepl("MS", colnames(data.mean))]
+
+imp.data.h = h
+for (i in 1:nrow(h)){
+  imp.data.h[i,is.na(imp.data.h[i,])] <- mean(imp.data.h[i,], na.rm = T)
+}
+
+imp.data.ms = ms
+for (i in 1:nrow(ms)){
+  imp.data.ms[i,is.na(imp.data.ms[i,])] <- mean(imp.data.ms[i,], na.rm = T)
+}
+
+# Download mean imputed dataset for linear correlation and logistic regression analysis
+#####
+imp.data=cbind(imp.data.h,imp.data.ms)
+data.preprocessed=cbind(Gene.names,imp.data)
+write.table(data.preprocessed, file = "./data/preprocessed_data_mean_imputed.txt", sep = "\t", quote = F, row.names = F, dec = ".")
+```
+
+
+
+## DIFFERENTIAL EXPRESSION ANALYSIS
+
+## DIFFERENTIAL EXPRESSION ANALYSIS
+Next, in order to detect significant differences in the HDL proteome of MetS subjects, we will perform differential expression analysis by fitting the data to a linear regression model using the **Limma** package.
+
+```{r}
+# Elaboration of the average expression matrix
+#####
+H <- rowMeans(data[, grep("^H", colnames(data))])
+MS <- rowMeans(data[, grep("^MS", colnames(data))])
+mean.expression <- matrix(c(H,MS),ncol=2)
+colnames(mean.expression) <- c("H","MS")
+rownames(mean.expression) <- rownames(data)
+
+# Scatterplot to visualize the dispersion between the two conditions
+######
+plot(H,MS,pch=19,cex=0.7,xlab="Healthy (H)",
+     ylab=substitute(italic("Metabolic Syndrome (MetS)")),
+     cex.lab=1,
+     col="grey")
+```
+
+Due to the low number of proteins and the low dispersion observed, we will consider as differentially expressed proteins those with Fold Change > |0.585| and unadjusted p-value < 0.05.
+
+```{r}
+# Linear regression model generation
+#####
+experimental.design <- model.matrix(~ -1 + factor(c(rep(1, 17), rep(2, 19))))
+colnames(experimental.design) <- c("H","MS")
+linear.fit <- lmFit(data, experimental.design)
+contrast.matrix <- makeContrasts(MS-H,levels=c("H","MS"))
+contrast.linear.fit <- contrasts.fit(linear.fit, contrast.matrix)
+contrast.results <- eBayes(contrast.linear.fit)
+nrow(data)
+H.MS <- topTable(contrast.results, number=174,coef=1,sort.by="logFC")
+log.fold.change <- H.MS$logFC
+p.value <- H.MS$P.Value
+protein.ids <- rownames(H.MS)
+length(protein.ids)
+names(log.fold.change) <- protein.ids
+names(p.value) <- protein.ids
+
+# Due to the low scattering seen in the scatterplot, we chose a restrictive value logFC
+######
+activated.protein <- protein.ids[log.fold.change > 0.585  & p.value < 0.05]
+repressed.protein <- protein.ids[log.fold.change < -0.585  & p.value < 0.05]
+
+length(activated.protein)   # 13 diferentially overexpressed proteins
+length(repressed.protein)   # 21 diferentially under-expressed proteins
+
+# Volcano plot visualization
+######
+log.p.val <- -log10(p.value)
+plot(log.fold.change,log.p.val,pch=19,col="grey",cex=0.8,
+     xlim=c(-12,12),ylim = c(0,6), 
+     xlab="log2(Fold-change)",ylab="-log10(p-value)",cex.lab=0.9, main="Volcano Plot")
+
+points(x = log.fold.change[activated.protein],
+       y = log.p.val[activated.protein],col="red",cex=0.8,pch=19)
+points(x = log.fold.change[repressed.protein],
+       y = log.p.val[repressed.protein],col="blue",cex=0.8,pch=19)
+
+legend("topright", legend = c("Overexpressed Proteins", "Under-expressed Proteins"), 
+       col = c("red", "blue"), pch = 19, cex = 1)
+```
+13 proteins are overexpressed and 21 proteins are under-expressed in the HDL of MetS subjects.
+
+
+## FUNCTIONAL ENRINCHMENT ANALYSIS
+In order to see in which biological processes (BP) the differentially detected proteins are involved, we will perform a functional enrichment analysis using the Gene Ontology (GO) database.
+Subsequently, we will perform a summary and visualisation of the Biological Process terms using REVIGO.
+
+### FUNCTIONAL ENRINCHMENT ANALYSIS (OVEREXPRESSED PROTEINS)
+
+```{r}
+# We associate each protein with its corresponding gene name
+#####
+data.analysis=cbind(Gene.names,data)
+activated.genes=data.analysis[activated.protein,1]
+repressed.genes=data.analysis[repressed.protein,1]
+
+
+# Enrichment analysis of the differentially activated genes
+#####
+activated.enrich.go <- enrichGO(gene          = activated.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.05,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+# Visualization of enrichment analysys
+#####
+barplot(activated.enrich.go,showCategory = 10,xlab="Number of genes",cex.names=0.2)
+
+# DOWNLOAD OF THE GO TERMS ASSOCIATED WITH THE ACTIVATED GENES 
+write.table(x=as.data.frame(activated.enrich.go),
+            file="activated.enrich.go.tsv", sep='\t')
+
+# Summary of revigo enrichment
+######
+revigo.names <- c("term_ID","description","frequency","value","uniqueness","dispensability","representative");
+revigo.data <- rbind(c("GO:0016126","sterol biosynthetic process",0.24780355936021625,3.950228570029902,0.8598895100042439,0,"sterol biosynthetic process"),
+                     c("GO:0006633","fatty acid biosynthetic process",0.653300292858752,1.814225350881565,0.8374690780517908,0.63011103,"sterol biosynthetic process"),
+                     c("GO:0006638","neutral lipid metabolic process",0.5406623113313809,3.3173911587861458,0.8784051667217184,0.53935673,"sterol biosynthetic process"),
+                     c("GO:0006639","acylglycerol metabolic process",0.5293985131786438,3.3173911587861458,0.8576357207308477,0.52704998,"sterol biosynthetic process"),
+                     c("GO:0006706","steroid catabolic process",0.14642937598558234,1.3942628166667828,0.8718576440278804,0.66773955,"sterol biosynthetic process"),
+                     c("GO:0008202","steroid metabolic process",1.4361342644739805,3.545278583711072,0.8787558636430619,0.48799241,"sterol biosynthetic process"),
+                     c("GO:0016042","lipid catabolic process",1.6445145302996171,2.389846061248035,0.8680842351580467,0.59858558,"sterol biosynthetic process"),
+                     c("GO:0030258","lipid modification",0.9461590448299165,1.6310854891649278,0.8720347182728235,0.65729777,"sterol biosynthetic process"),
+                     c("GO:0046486","glycerolipid metabolic process",1.9767965758053614,2.2231943483879664,0.8626267417258545,0.62239977,"sterol biosynthetic process"),
+                     c("GO:0046503","glycerolipid catabolic process",0.2928587519711647,2.457462919258945,0.8536797435876994,0.694597,"sterol biosynthetic process"),
+                     c("GO:0019068","virion assembly",0.1971164676728993,1.3129157862570044,1,-0,"virion assembly"),
+                     c("GO:0031099","regeneration",0.8560486596080198,1.6905424339874104,0.9970677357458354,-0,"regeneration"),
+                     c("GO:0007398","ectoderm development",0.10700608245100247,1.4360696455723363,0.9972667286841379,0.15124707,"regeneration"),
+                     c("GO:0032102","negative regulation of response to external stimulus",2.33160621761658,2.1321254602355233,0.9026037668492408,0.03139812,"negative regulation of response to external stimulus"),
+                     c("GO:0031348","negative regulation of defense response",1.4755575580085605,1.5055342872414141,0.9022825716615621,0.68111659,"negative regulation of response to external stimulus"),
+                     c("GO:0050728","negative regulation of inflammatory response",0.8898400540662311,1.723276192251575,0.8952886437462371,0.62798593,"negative regulation of response to external stimulus"),
+                     c("GO:0070374","positive regulation of ERK1 and ERK2 cascade",1.2221220995719757,1.6131362072381432,0.9188693892717814,0.28777398,"negative regulation of response to external stimulus"),
+                     c("GO:1902042","negative regulation of extrinsic apoptotic signaling pathway via death domain receptors",0.163325073214688,1.3530371032624566,0.9222898433921075,0.42833675,"negative regulation of response to external stimulus"),
+                     c("GO:1902430","negative regulation of amyloid-beta formation",0.10137418337463391,1.3754922896648258,0.9187614700736833,0.38626749,"negative regulation of response to external stimulus"),
+                     c("GO:1903034","regulation of response to wounding",0.8954719531425996,1.7771129374223325,0.9253970500540136,0.277213,"negative regulation of response to external stimulus"),
+                     c("GO:1903365","regulation of fear response",0.05631899076368552,1.671061244839281,0.9252955914794915,0.37798632,"negative regulation of response to external stimulus"),
+                     c("GO:1905906","regulation of amyloid fibril formation",0.09574228429826537,1.5411275750443434,0.9342764916009199,0.53214262,"negative regulation of response to external stimulus"),
+                     c("GO:1905907","negative regulation of amyloid fibril formation",0.07321468799279117,1.5900868724426471,0.9140779658696576,0.15531911,"negative regulation of response to external stimulus"),
+                     c("GO:2000352","negative regulation of endothelial cell apoptotic process",0.18022077044379364,1.3171030146146012,0.9517302039819233,0.44824386,"negative regulation of response to external stimulus"),
+                     c("GO:0032374","regulation of cholesterol transport",0.3491777427348502,3.7044218562368987,0.9048476860351031,-0,"regulation of cholesterol transport"),
+                     c("GO:0044058","regulation of digestive system process",0.2421716602838477,2.7667353577835203,0.9413858271006024,0.50137277,"regulation of cholesterol transport"),
+                     c("GO:0045807","positive regulation of endocytosis",0.5462942104077495,2.2231943483879664,0.9067488226762026,0.44333526,"regulation of cholesterol transport"),
+                     c("GO:0050708","regulation of protein secretion",1.4586618607794548,2.6812419036460717,0.9276571180539287,0.42326175,"regulation of cholesterol transport"),
+                     c("GO:1904478","regulation of intestinal absorption",0.06758278891642261,3.545278583711072,0.9099710799930055,0.32291173,"regulation of cholesterol transport"),
+                     c("GO:1905952","regulation of lipid localization",0.9067357512953367,3.031503214974495,0.9365245232781547,0.36378214,"regulation of cholesterol transport"),
+                     c("GO:0033344","cholesterol efflux",0.1520612750619509,3.8490087116510803,0.9117459556326537,-0,"cholesterol efflux"),
+                     c("GO:0006898","receptor-mediated endocytosis",0.929263347600811,1.5406404892861032,0.9574161017136856,0.21839703,"cholesterol efflux"),
+                     c("GO:0009306","protein secretion",0.6927235863933319,2.331058456250136,0.9294582331123105,0.39893053,"cholesterol efflux"),
+                     c("GO:0010876","lipid localization",2.1513854471727867,3.0799408321203865,0.9375497863077811,0.34035821,"cholesterol efflux"),
+                     c("GO:0015748","organophosphate ester transport",0.8222572651498086,3.216635063889664,0.9452175300617923,0.32438505,"cholesterol efflux"),
+                     c("GO:0015850","organic hydroxy compound transport",0.9461590448299165,2.5372330775067424,0.9445336935723345,0.38706266,"cholesterol efflux"),
+                     c("GO:0071692","protein localization to extracellular region",0.7377787790042802,2.307315275241484,0.93995067839456,0.40260561,"cholesterol efflux"),
+                     c("GO:0072578","neurotransmitter-gated ion channel clustering",0.06758278891642261,1.5411275750443434,0.9259783534410315,0.25493639,"cholesterol efflux"),
+                     c("GO:0097062","dendritic spine maintenance",0.06195088984005406,1.4513057550069954,0.9677109444685682,0.53529021,"cholesterol efflux"),
+                     c("GO:0034114","regulation of heterotypic cell-cell adhesion",0.1407974769092138,1.4043776984932794,0.9722993634359668,0.02328798,"regulation of heterotypic cell-cell adhesion"),
+                     c("GO:0034116","positive regulation of heterotypic cell-cell adhesion",0.08447848614552828,1.5504449996693874,0.9588785120843821,0.5150383,"regulation of heterotypic cell-cell adhesion"),
+                     c("GO:0034375","high-density lipoprotein particle remodeling",0.09011038522189682,3.427635379751855,0.9393027866720581,0.02246763,"high-density lipoprotein particle remodeling"),
+                     c("GO:0000302","response to reactive oxygen species",0.9968461365172336,2.9164774634499,0.9165931473949842,0.27505584,"high-density lipoprotein particle remodeling"),
+                     c("GO:0000305","response to oxygen radical",0.10700608245100247,1.3754922896648258,0.9252197859072022,0.66066223,"high-density lipoprotein particle remodeling"),
+                     c("GO:0002021","response to dietary excess",0.19148456859653074,1.3235314870752373,0.9571438001871824,0.10752148,"high-density lipoprotein particle remodeling"),
+                     c("GO:0002526","acute inflammatory response",0.4336562288803784,2.0972274232298687,0.9416992796451921,0.58541699,"high-density lipoprotein particle remodeling"),
+                     c("GO:0006953","acute-phase response",0.22527596305474207,2.700739688145817,0.9445204655761166,0.23877329,"high-density lipoprotein particle remodeling"),
+                     c("GO:0006979","response to oxidative stress",2.10069835548547,2.13430603954743,0.9469853432491784,0.31779884,"high-density lipoprotein particle remodeling"),
+                     c("GO:0007586","digestion",0.6307726965532777,1.941552076195913,0.9783991089071674,0.12003264,"high-density lipoprotein particle remodeling"),
+                     c("GO:0014012","peripheral nervous system axon regeneration",0.03942329353457986,1.671061244839281,0.9256128035631076,0.55033363,"high-density lipoprotein particle remodeling"),
+                     c("GO:0030168","platelet activation",0.5631899076368552,3.3173911587861458,0.8608135597984912,0.10087351,"high-density lipoprotein particle remodeling"),
+                     c("GO:0030195","negative regulation of blood coagulation",0.2590673575129534,2.6842814105307076,0.8309257808978602,0.69026838,"high-density lipoprotein particle remodeling"),
+                     c("GO:0033194","response to hydroperoxide",0.10137418337463391,1.5226458909353668,0.9298576885168718,0.65755679,"high-density lipoprotein particle remodeling"),
+                     c("GO:0044241","lipid digestion",0.09011038522189682,3.216635063889664,0.955433650715335,0.10087351,"high-density lipoprotein particle remodeling"),
+                     c("GO:0097746","blood vessel diameter maintenance",0.7884658706915972,1.9006121658024206,0.8900397094764767,0.31242564,"high-density lipoprotein particle remodeling"),
+                     c("GO:1900272","negative regulation of long-term synaptic potentiation",0.06758278891642261,1.61607683039105,0.9302385922267012,0.25091794,"high-density lipoprotein particle remodeling"),
+                     c("GO:1902950","regulation of dendritic spine maintenance",0.06195088984005406,1.61607683039105,0.9414964294380204,0.24918049,"high-density lipoprotein particle remodeling"),
+                     c("GO:0035641","locomotory exploration behavior",0.08447848614552828,1.5504449996693874,0.9657349246036142,0.08728998,"locomotory exploration behavior"),
+                     c("GO:0001662","behavioral fear response",0.1745888713674251,1.3089214894798682,0.9184233805573383,0.52011665,"locomotory exploration behavior"),
+                     c("GO:0002209","behavioral defense response",0.18022077044379364,1.3012976319803464,0.9182307206573423,0.52143851,"locomotory exploration behavior"),
+                     c("GO:0007616","long-term memory",0.2083802658256364,1.3129157862570044,0.9469625845657687,0.52011665,"locomotory exploration behavior"),
+                     c("GO:0035640","exploration behavior",0.1745888713674251,1.382101674226581,0.9640533371007368,0.48514239,"locomotory exploration behavior"),
+                     c("GO:0042180","cellular ketone metabolic process",0.4787114214913269,1.6175644103489706,0.9405686688949025,0.08033053,"cellular ketone metabolic process"),
+                     c("GO:0042632","cholesterol homeostasis",0.4843433205676954,3.545278583711072,0.9777666951797321,-0,"cholesterol homeostasis"),
+                     c("GO:0055088","lipid homeostasis",0.8842081549898626,3.0799408321203865,0.9835026948401232,0.57385642,"cholesterol homeostasis"),
+                     c("GO:0042744","hydrogen peroxide catabolic process",0.14642937598558234,3.049178316539471,0.9277114999024333,0.05859875,"hydrogen peroxide catabolic process"),
+                     c("GO:0032801","receptor catabolic process",0.10137418337463391,1.382101674226581,0.9405612879304103,0.39075556,"hydrogen peroxide catabolic process"),
+                     c("GO:0042159","lipoprotein catabolic process",0.09011038522189682,1.5411275750443434,0.9389222242019419,0.31389525,"hydrogen peroxide catabolic process"),
+                     c("GO:0046889","positive regulation of lipid biosynthetic process",0.4956071187204325,3.659142222380751,0.8355003244977277,0.02596088,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0010310","regulation of hydrogen peroxide metabolic process",0.10700608245100247,1.4699335381633638,0.9526495915714265,0.100283,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0010896","regulation of triglyceride catabolic process",0.07321468799279117,3.5211705232348782,0.8531089305007197,0.62043996,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0019216","regulation of lipid metabolic process",1.9035818878125703,2.369482798575814,0.9382700010415339,0.16233651,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0031331","positive regulation of cellular catabolic process",2.37102951115116,2.141564332439169,0.8953694382488971,0.28314717,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0051043","regulation of membrane protein ectodomain proteolysis",0.13516557783284522,1.4150797155076362,0.9223815730234369,0.57053427,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0051044","positive regulation of membrane protein ectodomain proteolysis",0.09011038522189682,1.5411275750443434,0.9107525428206225,0.6362574,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0060999","positive regulation of dendritic spine development",0.19148456859653074,1.3089214894798682,0.9640348158607878,0.11890357,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0062012","regulation of small molecule metabolic process",1.819103401667042,2.386841340445134,0.9450817320745006,0.13078805,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0062013","positive regulation of small molecule metabolic process",0.8053615679207029,3.2138847691369588,0.8888288591433349,0.23938975,"positive regulation of lipid biosynthetic process"),
+                     c("GO:1902931","negative regulation of alcohol biosynthetic process",0.07321468799279117,1.5411275750443434,0.8915955532051104,0.65341495,"positive regulation of lipid biosynthetic process"),
+                     c("GO:2000644","regulation of receptor catabolic process",0.06195088984005406,1.6359003254591764,0.9352986574783263,0.53053697,"positive regulation of lipid biosynthetic process"),
+                     c("GO:0050818","regulation of coagulation",0.4167605316512728,2.3894245296098817,0.9503042951505518,0.02638667,"regulation of coagulation"),
+                     c("GO:1900221","regulation of amyloid-beta clearance",0.10137418337463391,1.4699335381633638,0.9553373017020642,0.24202578,"regulation of coagulation"),
+                     c("GO:0051604","protein maturation",1.5938274386123001,3.508717785967395,0.9582273042507213,0.07948462,"protein maturation"),
+                     c("GO:0018149","peptide cross-linking",0.1971164676728993,2.9164774634499,0.965787747505415,0.22954572,"protein maturation"),
+                     c("GO:0031638","zymogen activation",0.275963054742059,2.461689840892801,0.9543056480513371,0.25771942,"protein maturation"),
+                     c("GO:0031639","plasminogen activation",0.05631899076368552,1.384685906130962,0.9591851224639588,0.66564234,"protein maturation"),
+                     c("GO:0051702","biological process involved in interaction with symbiont",0.6364045956296464,2.085818975784968,0.9723297320717859,-0,"biological process involved in interaction with symbiont"),
+                     c("GO:0002227","innate immune response in mucosa",0.1295336787564767,1.382101674226581,0.9340673124311052,0.38375221,"biological process involved in interaction with symbiont"),
+                     c("GO:0042742","defense response to bacterium",1.6276188330705113,1.3201840434446375,0.9189489466045413,0.54120595,"biological process involved in interaction with symbiont"),
+                     c("GO:0044403","biological process involved in symbiotic interaction",1.5262446496958775,1.4264245760338539,0.9772385420672643,0.48620123,"biological process involved in interaction with symbiont"),
+                     c("GO:0044794","positive regulation by host of viral process",0.11263798152737103,1.4699335381633638,0.9739210760430516,0.69535428,"biological process involved in interaction with symbiont"),
+                     c("GO:0072593","reactive oxygen species metabolic process",0.5913494030186979,1.5748791438466057,0.9680559682346952,0.09103782,"reactive oxygen species metabolic process"),
+                     c("GO:0097006","regulation of plasma lipoprotein particle levels",0.3097544492002703,3.7015091219871197,0.9774696827300176,0.02489378,"regulation of plasma lipoprotein particle levels"),
+                     c("GO:0098869","cellular oxidant detoxification",0.4843433205676954,3.545278583711072,0.932213283225802,-0,"cellular oxidant detoxification"),
+                     c("GO:0007263","nitric oxide mediated signal transduction",0.11826988060373957,1.3754922896648258,0.9435535501792485,0.36054821,"cellular oxidant detoxification"),
+                     c("GO:0007271","synaptic transmission, cholinergic",0.18585266952016222,1.3629868828868132,0.9930661534063181,0.12947524,"cellular oxidant detoxification"),
+                     c("GO:0009636","response to toxic substance",1.2277539986483443,2.697508504013552,0.9595338419608456,0.24554564,"cellular oxidant detoxification"),
+                     c("GO:0019934","cGMP-mediated signaling",0.15769317413831943,1.3129157862570044,0.9424135882631716,0.66032243,"cellular oxidant detoxification"),
+                     c("GO:0032488","Cdc42 protein signal transduction",0.05068709168731696,1.5504449996693874,0.9497911308953052,0.10128945,"cellular oxidant detoxification"),
+                     c("GO:0055094","response to lipoprotein particle",0.15769317413831943,1.3235314870752373,0.965829675154309,0.20277585,"cellular oxidant detoxification"),
+                     c("GO:0070371","ERK1 and ERK2 cascade",0.3097544492002703,1.382101674226581,0.9426685222044028,0.33768959,"cellular oxidant detoxification"),
+                     c("GO:0071402","cellular response to lipoprotein particle stimulus",0.1745888713674251,1.3089214894798682,0.9756112186596396,0.11201413,"cellular oxidant detoxification"),
+                     c("GO:1905918","regulation of CoA-transferase activity",0.04505519261094841,3.7015091219871197,0.958690860612828,0.01794981,"regulation of CoA-transferase activity"),
+                     c("GO:0032770","positive regulation of monooxygenase activity",0.1745888713674251,1.3414365401156934,0.9416273980667057,0.37125637,"regulation of CoA-transferase activity"),
+                     c("GO:0051006","positive regulation of lipoprotein lipase activity",0.04505519261094841,3.7015091219871197,0.942415946930292,0.26638534,"regulation of CoA-transferase activity"),
+                     c("GO:0051341","regulation of oxidoreductase activity",0.5575580085604867,2.13430603954743,0.9503939276276417,0.31835675,"regulation of CoA-transferase activity"),
+                     c("GO:0060191","regulation of lipase activity",0.4956071187204325,2.2637522234617315,0.9462433912750988,0.42525136,"regulation of CoA-transferase activity"));
+
+stuff <- data.frame(revigo.data);
+names(stuff) <- revigo.names;
+
+stuff$value <- as.numeric( as.character(stuff$value) );
+stuff$frequency <- as.numeric( as.character(stuff$frequency) );
+stuff$uniqueness <- as.numeric( as.character(stuff$uniqueness) );
+stuff$dispensability <- as.numeric( as.character(stuff$dispensability) );
+
+# Outputs to a PDF file
+pdf( file="revigo_treemap_activated_genes.pdf", width=16, height=9 ) 
+
+treemap(
+  stuff,
+  index = c("representative","description"),
+  vSize = "value",
+  type = "categorical",
+  vColor = "representative",
+  title = "Revigo TreeMap",
+  inflate.labels = FALSE,      
+  lowerbound.cex.labels = 0,   
+  bg.labels = 255,   
+  position.legend = "none"
+)
+
+dev.off()
+
+```
+
+### FUNCTIONAL ENRINCHMENT ANALYSIS (UNDER-EXPRESSED PROTEINS)
+
+```{r}
+
+# Enrichment analysis of the differentially repressed genes
+#####
+repressed.enrich.go <- enrichGO(gene          = repressed.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.05,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+
+
+# Visualization of enrichment analysys
+#####
+barplot(repressed.enrich.go,showCategory = 10,xlab="Number of genes")
+
+# DOWNLOAD OF THE GO TERMS ASSOCIATED WITH THE REPRESSED GENES 
+write.table(x=as.data.frame(repressed.enrich.go),
+            file="repressed.enrich.go.tsv",sep="\t")
+
+# Summary of revigo enrichment
+######						
+revigo.names <- c("term_ID","description","frequency","value","uniqueness","dispensability","representative");
+revigo.data <- rbind(c("GO:0006956","complement activation",0.27033115566569044,2.0988096479506506,0.7723304042753039,0.08024409,"complement activation"),
+                     c("GO:0016064","immunoglobulin mediated immune response",0.5012390177968011,1.6287744424401558,0.906354918581062,0.67074781,"complement activation"),
+                     c("GO:0032102","negative regulation of response to external stimulus",2.33160621761658,1.7608521068802396,0.7572473203083686,0.277213,"complement activation"),
+                     c("GO:1903034","regulation of response to wounding",0.8954719531425996,1.877031433911804,0.77532193350193,0.2210168,"complement activation"),
+                     c("GO:0007596","blood coagulation",0.9855823383644965,3.6097894223878684,0.5923238935921455,-0,"blood coagulation"),
+                     c("GO:0002526","acute inflammatory response",0.4336562288803784,2.212727070759453,0.9145661349257637,0.26759929,"blood coagulation"),
+                     c("GO:0006953","acute-phase response",0.22527596305474207,1.7086820433354657,0.9179784552448852,0.58541699,"blood coagulation"),
+                     c("GO:0050817","coagulation",0.9968461365172336,3.6097894223878684,0.9891615849247392,0.13326464,"blood coagulation"),
+                     c("GO:0050878","regulation of body fluid levels",1.98242847488173,2.660743550620165,0.83028882325597,0.36662494,"blood coagulation"),
+                     c("GO:0010755","regulation of plasminogen activation",0.10137418337463391,2.3249973193731317,0.8549090919096276,0.02083172,"regulation of plasminogen activation"),
+                     c("GO:1903317","regulation of protein maturation",0.3942329353457986,1.4180264421311328,0.9240470593182317,0.27043759,"regulation of plasminogen activation"),
+                     c("GO:0031639","plasminogen activation",0.05631899076368552,3.6097894223878684,0.8639212803544084,0,"plasminogen activation"),
+                     c("GO:0006096","glycolytic process",0.24780355936021625,1.3144788491778507,0.8950708662339536,0.43724025,"plasminogen activation"),
+                     c("GO:0030212","hyaluronan metabolic process",0.163325073214688,1.9394284997708058,0.920853326237328,0.13278094,"plasminogen activation"),
+                     c("GO:0031638","zymogen activation",0.275963054742059,2.660743550620165,0.8499282797617232,0.66564234,"plasminogen activation"),
+                     c("GO:0051604","protein maturation",1.5938274386123001,2.0988096479506506,0.9205330702067469,0.22247466,"plasminogen activation"),
+                     c("GO:0072376","protein activation cascade",0.10137418337463391,2.249215183825657,0.861369260318923,0.56664756,"plasminogen activation"),
+                     c("GO:0034694","response to prostaglandin",0.18022077044379364,2.033808726620647,0.9606309710108211,0.07726961,"response to prostaglandin"),
+                     c("GO:0035966","response to topologically incorrect protein",0.7940977697679658,1.9338449667817195,0.9168505555870542,0.29702924,"response to prostaglandin"),
+                     c("GO:0050818","regulation of coagulation",0.4167605316512728,2.5931851593715955,0.89866110455032,0.02374749,"regulation of coagulation"),
+                     c("GO:0051131","chaperone-mediated protein complex assembly",0.12390177968010813,2.159098837510241,0.9997403030784062,-0,"chaperone-mediated protein complex assembly"));
+
+stuff <- data.frame(revigo.data);
+names(stuff) <- revigo.names;
+
+stuff$value <- as.numeric( as.character(stuff$value) );
+stuff$frequency <- as.numeric( as.character(stuff$frequency) );
+stuff$uniqueness <- as.numeric( as.character(stuff$uniqueness) );
+stuff$dispensability <- as.numeric( as.character(stuff$dispensability) );
+
+pdf( file="revigo_treemap_repressed_genes.pdf", width=16, height=9 ) 
+
+treemap(
+  stuff,
+  index = c("representative","description"),
+  vSize = "value",
+  type = "categorical",
+  vColor = "representative",
+  title = "Revigo TreeMap",
+  inflate.labels = FALSE,      
+  lowerbound.cex.labels = 0,   
+  bg.labels = 255,  
+  position.legend = "none"
+)
+
+dev.off()
+
+
+
+
+```
